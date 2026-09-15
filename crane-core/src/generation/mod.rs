@@ -71,6 +71,18 @@ impl Default for TranscribeOptions {
     }
 }
 
+/// A finished or partial transcription result.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Transcript {
+    /// The transcribed text.
+    pub text: String,
+    /// BCP-47-ish language code the model detected/used, if it reports one.
+    pub language: Option<String>,
+    /// `false` for a partial/incremental result that may still change;
+    /// `true` for a final result.
+    pub is_final: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct GenerationConfig {
     pub max_new_tokens: usize,

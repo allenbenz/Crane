@@ -4,19 +4,7 @@
 //! never import model-specific types.
 
 use anyhow::Result;
-pub use crane_core::generation::TranscribeOptions;
-
-/// A finished or partial transcription result.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Transcript {
-    /// The transcribed text.
-    pub text: String,
-    /// BCP-47-ish language code the model detected/used, if it reports one.
-    pub language: Option<String>,
-    /// `false` for a partial/incremental result that may still change;
-    /// `true` for a final result.
-    pub is_final: bool,
-}
+pub use crane_core::generation::{TranscribeOptions, Transcript};
 
 /// A stream of incremental transcripts produced during streaming ASR.
 ///

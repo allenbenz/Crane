@@ -4,52 +4,55 @@ use anyhow::Result;
 use crane_core::models::qwen3_asr::Model;
 
 use super::asr::{Asr, TranscribeOptions, Transcript};
+use super::language_qwen3::{LANGUAGES, language_name_to_code};
 
-/// BCP-47 language codes Qwen3-ASR claims to support, per its model card.
-/// Sorted alphabetically.
-const LANGUAGES: &[&str] = &[
-    "ar", "cs", "da", "de", "el", "en", "es", "fa", "fi", "fil", "fr", "hi", "hu", "id", "it",
-    "ja", "ko", "mk", "ms", "nl", "pl", "pt", "ro", "ru", "sv", "th", "tr", "vi", "yue", "zh",
-];
+/// BCP-47 codes Qwen3-ASR claims to support; see [`LANGUAGES`].
+fn supported_languages() -> Vec<String> {
+    LANGUAGES.iter().map(ToString::to_string).collect()
+}
 
 impl Asr for Model {
     fn input_sample_rate(&self) -> u32 {
         self.sample_rate()
     }
 
-    /// Delegates to the inherent [`Model::transcribe`], wrapping the returned
-    /// text in a [`Transcript`] (the model doesn't report a detected
-    /// language, so `language` is always `None`).
+    /// Delegates to [`Model::transcribe`], mapping the announced language
+    /// name to its ISO code ("English" into "en"); unrecognized names pass
+    /// through.
     fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOptions) -> Result<Transcript> {
-        let text = Self::transcribe(self, audio, opts)?;
-        Ok(Transcript {
-            text,
-            language: None,
-            is_final: true,
-        })
+        let mut transcript = Self::transcribe(self, audio, opts)?;
+        if let Some(name) = transcript.language.take() {
+            transcript.language = Some(language_name_to_code(&name).to_string());
+        }
+        Ok(transcript)
     }
 
     fn supported_languages(&self) -> Vec<String> {
-        LANGUAGES.iter().map(ToString::to_string).collect()
+        supported_languages()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::LANGUAGES;
+    use super::*;
 
     #[test]
     fn supported_languages_is_sorted_and_nonempty() {
-        assert!(!LANGUAGES.is_empty());
-        let mut sorted = LANGUAGES.to_vec();
+        let languages = supported_languages();
+        assert!(!languages.is_empty());
+        let mut sorted = languages.clone();
         sorted.sort_unstable();
-        assert_eq!(LANGUAGES, sorted.as_slice());
+        assert_eq!(languages, sorted);
     }
 
     #[test]
     fn supported_languages_contains_expected_codes() {
+        let languages = supported_languages();
         for code in ["en", "zh", "de"] {
-            assert!(LANGUAGES.contains(&code), "missing language code {code}");
+            assert!(
+                languages.contains(&code.to_string()),
+                "missing language code {code}"
+            );
         }
     }
 }

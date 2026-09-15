@@ -19,7 +19,7 @@ use super::feature_extractor::{
 };
 use super::modeling::Qwen3AsrModel;
 use crate::autotokenizer::AutoTokenizer;
-use crate::generation::TranscribeOptions;
+use crate::generation::{TranscribeOptions, Transcript};
 use crate::utils::utils::get_safetensors_files;
 
 /// Builds the fixed Qwen3-ASR chat-template prompt for a single audio-only
@@ -35,6 +35,176 @@ fn build_asr_prompt(n_audio_tokens: usize) -> String {
     }
     prompt.push_str("<|audio_end|><|im_end|>\n<|im_start|>assistant\n");
     prompt
+}
+
+/// Tag separating the language announcement from the transcript, e.g.
+/// `language English<asr_text>Hello, how are you?.`
+const ASR_TEXT_TAG: &str = "<asr_text>";
+
+/// Prefix of the detected-language line before [`ASR_TEXT_TAG`].
+const LANGUAGE_PREFIX: &str = "language ";
+
+/// Collapse threshold for repeated characters and patterns.
+const REPEAT_THRESHOLD: usize = 20;
+
+/// Longest pattern, in characters, the scrubber considers.
+const REPEAT_PATTERN_MAX_LEN: usize = 20;
+
+/// Capitalizes a language name as Qwen3-ASR reports it
+/// (`"english"`/`"ENGLISH"` → `"English"`); mirrors qwen-asr's
+/// `normalize_language_name`.
+fn normalize_language_name(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+        None => String::new(),
+    }
+}
+
+/// Parses Qwen3-ASR's raw assistant response into a [`Transcript`].
+///
+/// The response is structured — `language English<asr_text>No, I'm not.`
+/// — mirroring qwen-asr's `parse_asr_output`:
+///
+/// * repetition loops are scrubbed first ([`detect_and_fix_repetitions`]);
+/// * the split is on the **first** [`ASR_TEXT_TAG`]; a tag-less response
+///   is plain text with no language;
+/// * the language is the first metadata line starting with `language `,
+///   kept as the announced name (e.g. "English");
+/// * `"language None"` means empty audio: no language, text kept.
+#[must_use]
+pub fn parse_asr_output(raw: &str) -> Transcript {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Transcript {
+            language: None,
+            text: String::new(),
+            is_final: true,
+        };
+    }
+
+    let scrubbed = detect_and_fix_repetitions(trimmed);
+
+    let Some((metadata, text)) = scrubbed.split_once(ASR_TEXT_TAG) else {
+        return Transcript {
+            language: None,
+            text: scrubbed,
+            is_final: true,
+        };
+    };
+    let text = text.trim();
+
+    // "language None" marks empty audio.
+    if metadata.to_lowercase().contains("language none") {
+        return Transcript {
+            language: None,
+            text: text.to_string(),
+            is_final: true,
+        };
+    }
+
+    // First `language ` line wins if any.
+    let mut language = None;
+    for line in metadata.lines() {
+        let line = line.trim();
+        let has_prefix = line
+            .as_bytes()
+            .get(..LANGUAGE_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(LANGUAGE_PREFIX.as_bytes()));
+        if !has_prefix {
+            continue;
+        }
+        // Safe: the matched prefix is ASCII, so this is a char boundary.
+        let value = line[LANGUAGE_PREFIX.len()..].trim();
+        if !value.is_empty() {
+            language = Some(normalize_language_name(value));
+        }
+        break;
+    }
+
+    Transcript {
+        language,
+        text: text.to_string(),
+        is_final: true,
+    }
+}
+
+/// Collapses the repetition loops degenerate generations sometimes emit,
+/// mirroring qwen-asr's `detect_and_fix_repetitions`: character runs
+/// longer than [`REPEAT_THRESHOLD`] and patterns of up to
+/// [`REPEAT_PATTERN_MAX_LEN`] chars repeated [`REPEAT_THRESHOLD`] times
+/// each collapse to one copy. Operates on chars, not bytes.
+fn detect_and_fix_repetitions(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let chars = fix_char_repeats(&chars);
+    let chars = fix_pattern_repeats(&chars);
+    chars.into_iter().collect()
+}
+
+/// Collapses runs of a single character longer than [`REPEAT_THRESHOLD`]
+/// to one copy.
+fn fix_char_repeats(s: &[char]) -> Vec<char> {
+    let mut result = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let mut run = 1;
+        while i + run < s.len() && s[i + run] == s[i] {
+            run += 1;
+        }
+        if run > REPEAT_THRESHOLD {
+            result.push(s[i]);
+        } else {
+            result.extend_from_slice(&s[i..i + run]);
+        }
+        i += run;
+    }
+    result
+}
+
+/// When the input is longer than than [`REPEAT_THRESHOLD`] * 2 chars,
+/// this collapses the first pattern of 1..=[`REPEAT_PATTERN_MAX_LEN`] chars
+/// repeated [`REPEAT_THRESHOLD`] times to one copy.
+fn fix_pattern_repeats(s: &[char]) -> Vec<char> {
+    let min_repeat_chars = REPEAT_THRESHOLD * 2;
+    let mut result = Vec::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let n = rest.len();
+        if n < min_repeat_chars {
+            result.extend_from_slice(rest);
+            return result;
+        }
+
+        let mut collapse = None;
+        'scan: for i in 0..=(n - min_repeat_chars) {
+            for k in 1..=REPEAT_PATTERN_MAX_LEN {
+                if i + k * REPEAT_THRESHOLD > n {
+                    break;
+                }
+                let pattern = &rest[i..i + k];
+                let repeats_threshold =
+                    (1..REPEAT_THRESHOLD).all(|rep| &rest[i + rep * k..i + rep * k + k] == pattern);
+                if !repeats_threshold {
+                    continue;
+                }
+                // Consume consecutive copies past the threshold too.
+                let mut end = i + k * REPEAT_THRESHOLD;
+                while end + k <= n && &rest[end..end + k] == pattern {
+                    end += k;
+                }
+                collapse = Some((i, k, end));
+                break 'scan;
+            }
+        }
+
+        let Some((i, k, end)) = collapse else {
+            result.extend_from_slice(rest);
+            return result;
+        };
+        result.extend_from_slice(&rest[..i]);
+        result.extend_from_slice(&rest[i..i + k]);
+        rest = &rest[end..];
+    }
 }
 
 /// Public Qwen3-ASR model: loads a `-hf` checkpoint and transcribes audio to
@@ -100,18 +270,20 @@ impl Model {
         })
     }
 
-    /// Transcribes `audio` (mono `f32` PCM at [`Self::sample_rate`]) to
-    /// text.
+    /// Transcribes `audio` (mono `f32` PCM at [`Self::sample_rate`]) to a
+    /// [`Transcript`]; `language` holds the announced name (e.g. "English") —
+    /// the crate-level `Asr` impl maps it to an ISO code.
     ///
     /// Runs one non-streaming call: extract mel features, prefill the
     /// decoder with the spliced audio/text embeddings, then autoregressively
-    /// decode until an EOS token or `opts.max_new_tokens` is reached.
+    /// decode until an EOS token or `opts.max_new_tokens` is reached. The
+    /// decoded response is parsed by [`parse_asr_output`].
     ///
     /// # Errors
     ///
     /// Returns an error if feature extraction, tokenization, or any model
     /// forward pass fails.
-    pub fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOptions) -> Result<String> {
+    pub fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOptions) -> Result<Transcript> {
         let features = self.feature_extractor.extract(audio)?;
         let n_audio_tokens = get_feat_extract_output_lengths(features.real_frame_count);
 
@@ -192,9 +364,11 @@ impl Model {
 
         self.inner.clear_kv_cache();
 
-        self.tokenizer
+        let raw = self
+            .tokenizer
             .decode(&generated_tokens, true)
-            .map_err(|e| anyhow::anyhow!("qwen3_asr transcript decoding failed: {e}"))
+            .map_err(|e| anyhow::anyhow!("qwen3_asr transcript decoding failed: {e}"))?;
+        Ok(parse_asr_output(&raw))
     }
 
     /// Audio sample rate this model's feature extractor expects, in Hz.
@@ -250,6 +424,149 @@ mod tests {
                 "mismatch for {mel_frames} mel frames"
             );
         }
+    }
+
+    #[test]
+    fn parse_splits_language_and_text() {
+        let t = parse_asr_output("language English<asr_text>No, I'm not.");
+        assert_eq!(t.language.as_deref(), Some("English"));
+        assert_eq!(t.text, "No, I'm not.");
+        assert!(t.is_final);
+    }
+
+    #[test]
+    fn parse_normalizes_language_name_casing() {
+        let t = parse_asr_output("language english<asr_text>hi");
+        assert_eq!(t.language.as_deref(), Some("English"));
+        let t = parse_asr_output("language ENGLISH<asr_text>hi");
+        assert_eq!(t.language.as_deref(), Some("English"));
+    }
+
+    #[test]
+    fn parse_reads_language_from_first_matching_line() {
+        // Extra context lines between announcement and tag are ignored.
+        let t = parse_asr_output("language English\nextra context\n<asr_text>hello");
+        assert_eq!(t.language.as_deref(), Some("English"));
+        assert_eq!(t.text, "hello");
+
+        // Only the first `language ` line counts.
+        let t = parse_asr_output("language English\nlanguage Chinese<asr_text>hello");
+        assert_eq!(t.language.as_deref(), Some("English"));
+    }
+
+    #[test]
+    fn parse_tagless_output_is_plain_text() {
+        let t = parse_asr_output("Hello, I am speaking.");
+        assert_eq!(t.language, None);
+        assert_eq!(t.text, "Hello, I am speaking.");
+    }
+
+    #[test]
+    fn parse_language_none_means_empty_audio() {
+        let t = parse_asr_output("language None<asr_text>");
+        assert_eq!(t.language, None);
+        assert_eq!(t.text, "");
+
+        // Text after a "language None" announcement is still kept.
+        let t = parse_asr_output("language None<asr_text>leftover");
+        assert_eq!(t.language, None);
+        assert_eq!(t.text, "leftover");
+    }
+
+    #[test]
+    fn parse_splits_on_first_tag_occurrence() {
+        let t = parse_asr_output("language English<asr_text>he said <asr_text> out loud");
+        assert_eq!(t.language.as_deref(), Some("English"));
+        assert_eq!(t.text, "he said <asr_text> out loud");
+    }
+
+    #[test]
+    fn parse_empty_and_whitespace_only_input() {
+        assert_eq!(
+            parse_asr_output(""),
+            Transcript {
+                language: None,
+                text: String::new(),
+                is_final: true
+            }
+        );
+    }
+
+    #[test]
+    fn parse_trims_surrounding_whitespace() {
+        let t = parse_asr_output("  language English<asr_text>  hi  ");
+        assert_eq!(t.language.as_deref(), Some("English"));
+        assert_eq!(t.text, "hi");
+    }
+
+    #[test]
+    fn parse_empty_language_value_is_ignored() {
+        let t = parse_asr_output("language <asr_text>hi");
+        assert_eq!(t.language, None);
+        assert_eq!(t.text, "hi");
+    }
+
+    #[test]
+    fn repetition_scrub_collapses_char_runs() {
+        // Above the threshold collapses to one copy...
+        assert_eq!(detect_and_fix_repetitions(&"a".repeat(21)), "a");
+        // ...exactly at the threshold is kept.
+        assert_eq!(detect_and_fix_repetitions(&"a".repeat(20)), "a".repeat(20));
+        assert_eq!(
+            detect_and_fix_repetitions(&format!("stop{}", ".".repeat(40))),
+            "stop."
+        );
+    }
+
+    #[test]
+    fn repetition_scrub_collapses_pattern_loops() {
+        // 19 copies of a 3-char pattern stay...
+        assert_eq!(
+            detect_and_fix_repetitions(&"ha ".repeat(19)),
+            "ha ".repeat(19)
+        );
+        // ...25 copies collapse to one.
+        assert_eq!(detect_and_fix_repetitions(&"ha ".repeat(25)), "ha ");
+        assert_eq!(
+            detect_and_fix_repetitions(&"the cat ".repeat(22)),
+            "the cat "
+        );
+    }
+
+    #[test]
+    fn repetition_scrub_keeps_prefix_and_tail() {
+        let raw = format!("once upon a time {}the end", "la ".repeat(21));
+        assert_eq!(
+            detect_and_fix_repetitions(&raw),
+            "once upon a time la the end"
+        );
+
+        // Scanning continues past a collapse.
+        assert_eq!(
+            detect_and_fix_repetitions(&format!("{}{}", "a b ".repeat(20), "c d ".repeat(20))),
+            "a b c d "
+        );
+    }
+
+    #[test]
+    fn repetition_scrub_operates_on_chars_not_bytes() {
+        // Multi-byte characters are single units, not bytes.
+        assert_eq!(detect_and_fix_repetitions(&"你".repeat(21)), "你");
+        assert_eq!(detect_and_fix_repetitions(&"你好".repeat(20)), "你好");
+    }
+
+    #[test]
+    fn parse_scrubs_repetition_loops_in_text() {
+        let raw = format!("language English<asr_text>{}done", "no ".repeat(30));
+        let t = parse_asr_output(&raw);
+        assert_eq!(t.language.as_deref(), Some("English"));
+        assert_eq!(t.text, "no done");
+
+        // Trim precedes scrubbing (reference order), so the final copy's
+        // lost trailing space leaves a partial: `"no "` ×30 → `no no`.
+        let raw = format!("language English<asr_text>{}", "no ".repeat(30));
+        let t = parse_asr_output(&raw);
+        assert_eq!(t.text, "no no");
     }
 
     const TEST_VOCAB_SIZE: usize = 32;

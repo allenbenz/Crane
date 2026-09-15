@@ -4,6 +4,7 @@ pub mod asr;
 #[cfg(feature = "onnx")]
 mod asr_client;
 mod asr_qwen3;
+mod language_qwen3;
 mod pcm;
 pub mod tts;
 mod tts_client;

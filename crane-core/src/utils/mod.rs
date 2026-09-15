@@ -15,7 +15,7 @@ pub fn select_device(force_cpu: bool) -> Result<Device> {
     if force_cpu {
         Ok(Device::Cpu)
     } else if cuda_is_available() {
-        Ok(Device::new_cuda(0)?)
+        Ok(Device::new_cuda_with_stream(0)?)
     } else if metal_is_available() {
         Ok(Device::new_metal(0)?)
     } else {

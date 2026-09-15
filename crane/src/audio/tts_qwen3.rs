@@ -6,50 +6,9 @@ use crane_core::generation::SpeechOptions;
 use crane_core::models::qwen3_tts::Model;
 use crane_core::models::qwen3_tts::modeling::TalkerConfig;
 
+use super::language_qwen3::{language_code_to_name, language_name_to_code};
 use super::pcm::{AudioInfo, load_wav_f32};
 use super::tts::{Tts, TtsStream, VoiceInfo};
-
-/// Maps a `codec_language_id` language name to its ISO 639-1 code.
-///
-/// Names not recognized (e.g. a language added to a future checkpoint) pass
-/// through unchanged.
-fn language_name_to_code(name: &str) -> &str {
-    match name {
-        "chinese" => "zh",
-        "english" => "en",
-        "german" => "de",
-        "italian" => "it",
-        "portuguese" => "pt",
-        "spanish" => "es",
-        "japanese" => "ja",
-        "korean" => "ko",
-        "french" => "fr",
-        "russian" => "ru",
-        other => other,
-    }
-}
-
-/// Maps an ISO 639-1 language code to the full English name that
-/// `codec_language_id` uses as its key.
-///
-/// Codes not in the mapping — including "auto" and already-full names such
-/// as "english" — pass through unchanged, so both formats work.
-fn language_code_to_name(code: &str) -> String {
-    match code {
-        "zh" => "chinese",
-        "en" => "english",
-        "de" => "german",
-        "it" => "italian",
-        "pt" => "portuguese",
-        "es" => "spanish",
-        "ja" => "japanese",
-        "ko" => "korean",
-        "fr" => "french",
-        "ru" => "russian",
-        other => other,
-    }
-    .to_string()
-}
 
 /// Derives the sorted list of ISO 639-1 language codes a custom-voice talker
 /// supports.
@@ -154,33 +113,7 @@ impl Tts for Model {
 #[cfg(test)]
 mod tests {
     use super::TalkerConfig;
-    use super::language_code_to_name;
     use super::talker_languages;
-
-    #[test]
-    fn language_code_to_name_known_codes() {
-        assert_eq!(language_code_to_name("zh"), "chinese");
-        assert_eq!(language_code_to_name("en"), "english");
-        assert_eq!(language_code_to_name("de"), "german");
-        assert_eq!(language_code_to_name("ja"), "japanese");
-        assert_eq!(language_code_to_name("ko"), "korean");
-        assert_eq!(language_code_to_name("fr"), "french");
-        assert_eq!(language_code_to_name("ru"), "russian");
-        assert_eq!(language_code_to_name("it"), "italian");
-        assert_eq!(language_code_to_name("pt"), "portuguese");
-        assert_eq!(language_code_to_name("es"), "spanish");
-    }
-
-    #[test]
-    fn language_code_to_name_passthrough() {
-        // Full names pass through unchanged (backwards compatibility).
-        assert_eq!(language_code_to_name("english"), "english");
-        assert_eq!(language_code_to_name("chinese"), "chinese");
-        // "auto" passes through.
-        assert_eq!(language_code_to_name("auto"), "auto");
-        // Unknown codes pass through.
-        assert_eq!(language_code_to_name("xx"), "xx");
-    }
 
     fn talker_config(codec_language_id: &str, spk_is_dialect: &str) -> TalkerConfig {
         let json = format!(
